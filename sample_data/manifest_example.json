@@ -1,0 +1,12 @@
+[
+  {
+    "id": "000001",
+    "imageUrl": "/images/000001.jpg",
+    "caption": "a dog running on the grass near a blue ball"
+  },
+  {
+    "id": "000002",
+    "imageUrl": "/images/000002.jpg",
+    "caption": "a person riding a bicycle beside a small river"
+  }
+]
