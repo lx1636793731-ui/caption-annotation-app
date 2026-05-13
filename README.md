@@ -1,36 +1,53 @@
 # Caption Annotation App
 
-A local web-based tool for human caption span annotation. Select text spans in image captions, assign attributes with color coding, and export labeled records — all through an interactive React UI backed by FastAPI and SQLite.
+A local web-based tool for human caption span annotation. Each annotator runs the app on their own machine, imports their assigned batch of images and captions, labels text spans with colored attributes, and exports structured records — all through an interactive React UI backed by FastAPI and SQLite.
 
 ## Key Features
 
 - **Span-level annotation** — drag-select text in captions, assign colored attribute labels, and save structured annotations with start/end offsets
 - **Attribute management** — create custom attributes with colors, search, rename, reorder, and toggle compact/comfort display
 - **Visual preview** — selected text immediately shows the attribute color before saving, colored spans are clickable for detail popovers
-- **Batch import** — upload a zip of images + a JSONL/JSON caption file, auto-matched by image_id or filename
-- **Single upload** — upload one image with a caption directly
+- **Command-line data import** — one script reads a local image directory + a JSONL caption file, copies matching images, and imports everything into the app
 - **Caption editing** — edit captions inline, adjust font size, search with yellow highlight, scrollable fixed-height display
 - **Flexible layout** — three-panel workspace (Image+Caption / Note / Records), with persistent customizable layout via drag-to-resize panels
-- **Export** — download all records as JSON or CSV
+- **Export** — download all records as JSON or CSV from the UI or the command line
 - **Multi-user** — simple username-based login, each annotator's records are tracked separately; users can only delete their own annotations
 - **Erase tool** — remove mistaken selections or overlapping annotations by the current user
-- **Network access** — accessible from other devices on the same Wi-Fi
 
-## Quick Start
+## Requirements
 
-### 1. Backend
+- Python 3.8+ (for the backend and the import script)
+- Node.js 18+ (for the frontend; see [troubleshooting notes below](#troubleshooting-network--install-issues) if you are on a server without direct internet access)
+
+## End-to-End Workflow
+
+Each annotator follows these steps on their own machine.
+
+### Step 1 — Clone the repository
+
+```bash
+git clone https://github.com/lx1636793731-ui/caption-annotation-app.git
+cd caption-annotation-app
+```
+
+### Step 2 — Start the backend
+
+Open a dedicated terminal and keep it running:
 
 ```bash
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Requirements: Python 3.8+, `fastapi`, `uvicorn`, `python-multipart`.
+The backend listens on `http://localhost:8000`. The `--host 0.0.0.0` flag makes it reachable from the frontend dev server.
 
-### 2. Frontend
+### Step 3 — Start the frontend
+
+Open a second terminal and keep it running:
 
 ```bash
 cd frontend
@@ -38,74 +55,89 @@ npm install
 npm run dev
 ```
 
-Requirements: Node.js 16+, npm 7+.
+The frontend dev server starts at `http://localhost:5173`.
 
-### 3. Open
+### Step 4 — Import your data
+
+Use `setup_server_data.py` to import a local image directory and a JSONL caption file in one shot. This script copies matched images into the backend and registers all items via the API.
+
+```bash
+python setup_server_data.py \
+    --image-dir /path/to/your/images \
+    --caption-file /path/to/your/captions.jsonl \
+    --user your_name
+```
+
+| Argument | Description |
+|----------|-------------|
+| `--image-dir` | Directory containing image files (`.jpg`, `.png`, `.webp`, `.gif`). Can contain subdirectories — the script scans recursively. |
+| `--caption-file` | A `.jsonl` or `.json` file. Each line is a JSON object. |
+| `--user` | A username for the audit log (shown in the import record). |
+| `--symlink` | Optional. Use symlinks instead of copying images (saves disk, but only works on the same filesystem). |
+| `--api-base` | Optional. Defaults to `http://127.0.0.1:8000`. Change if the backend runs elsewhere. |
+
+**Caption file format.** The script reads these fields from each JSON line (first match wins):
+
+| Priority | Field used for matching | Priority | Field used for caption text |
+|----------|------------------------|----------|----------------------------|
+| 1 | `image_id` | 1 | `reference_caption` |
+| 2 | `image_path` (filename part) | 2 | `caption` |
+| 3 | `id` / `imageUrl` / `url` | 3 | `text` |
+
+Example `.jsonl`:
+
+```jsonl
+{"image_id": "000001", "reference_caption": "a dog running on grass"}
+{"image_path": "photos/beach.jpg", "caption": "people walking on the beach at sunset"}
+```
+
+The script will print a summary: how many entries matched, how many images are missing, and how many items were imported. If any images referenced in the JSONL are not found under `--image-dir`, their filenames are listed so you can investigate.
+
+### Step 5 — Open and log in
 
 ```
 http://localhost:5173
 ```
 
-Log in with any username (e.g. `user1`). The account is created automatically on first login.
+Log in with any username (e.g. your name). The account is created automatically on first login. You are now ready to annotate.
 
-### Access from Other Devices
+### Step 6 — Annotate
 
-Make sure the backend is started with `--host 0.0.0.0`. The frontend dev server will display a network URL (e.g. `http://10.4.147.182:5173`). Open this address on any device connected to the same Wi-Fi.
+1. Select an attribute in the right panel (e.g. `Object`)
+2. Drag-select text in the `Original Caption` box — a preview highlight appears immediately in the attribute's color
+3. Optionally add a note in the middle panel
+4. Click `Save selected-word annotation`
+5. The saved annotation appears with the attribute's color; click any colored span to see details and notes
+6. Use `Erase` to remove overlapping annotations, or click a colored span and choose `Erase this annotation` in the popover
+7. Navigate between images with the arrow buttons at the bottom
 
-If the page doesn't load, the network may have device isolation enabled — try a mobile hotspot or deploy to a server instead.
+### Step 7 — Export your annotations
 
-## Annotation Workflow
+Once you finish annotating, export your records. Two options:
 
-1. Log in with a username
-2. Upload or import images with captions
-3. Select an attribute in the right panel (e.g. `Object`)
-4. Drag-select text in the `Original Caption` box — a preview highlight appears immediately
-5. Optionally add a note in the scrollable text area
-6. Click `Save selected-word annotation`
-7. The saved annotation appears with the attribute's color; click any colored span to see details
-8. Use `Erase` to remove overlapping annotations, or click a colored span and choose `Erase this annotation` in the popover
+**From the UI:** Click `Export JSON` or `Export CSV` in the top toolbar — the file downloads immediately.
 
-## Importing Data
+**From the command line:**
 
-### Single Image + Caption
+```bash
+# JSON export (items + attributes + all records)
+curl http://localhost:8000/api/export/json \
+    -o annotations_$(date +%Y%m%d_%H%M).json
 
-Use the upload form in the UI — select an image file and type or paste the caption.
-
-### Batch: Image Zip + Caption File
-
-Upload a `.zip` file containing images and a `.json` / `.jsonl` caption file.
-
-Matching logic:
-
-1. If `image_id` is present in the caption entry, use it as the match key
-2. Otherwise, use the filename from `image_path`
-
-Caption field priority: `reference_caption` > `caption` > `text`
-
-### Manifest Import
-
-Post a JSON array to `/api/items/import`:
-
-```json
-[
-  {
-    "id": "000001",
-    "imageUrl": "/images/000001.jpg",
-    "caption": "a dog running on the grass near a blue ball"
-  }
-]
+# CSV export (flat record table)
+curl http://localhost:8000/api/export/csv \
+    -o annotations_$(date +%Y%m%d_%H%M).csv
 ```
 
-Use [`generate_manifest.py`](generate_manifest.py) to convert a CSV (`filename,caption`) into the import format.
+**Backup the raw database:**
 
-## Exporting Data
+```bash
+cp backend/data/annotation.db annotation_backup_$(date +%Y%m%d_%H%M).db
+```
 
-Two endpoints provide downloads:
+### Step 8 — Submit
 
-- **JSON** — `GET /api/export/json` returns a structured JSON file with items, attributes, and all records
-- **CSV** — `GET /api/export/csv` returns a flat CSV of all annotation records
-
-In the UI, use the `Export JSON` and `Export CSV` buttons.
+Send your exported `.json` or `.csv` file to whoever is collecting the results. Each annotator's records are tagged with their username, so multiple exports can be merged safely.
 
 ## API Reference
 
@@ -195,6 +227,7 @@ caption-annotation-app/
 │       ├── App.jsx          # Main React component (~60k, all UI logic)
 │       ├── main.jsx         # Entry point
 │       └── style.css        # Tailwind + custom styles
+├── setup_server_data.py     # Import script: image dir + JSONL → backend
 ├── sample_data/
 │   └── manifest_example.json
 └── generate_manifest.py     # CSV → manifest JSON helper
@@ -207,6 +240,43 @@ caption-annotation-app/
 | Frontend | React 18, Vite 5, Tailwind CSS 3, Framer Motion 11, Lucide React icons |
 | Backend | FastAPI, Uvicorn, SQLite |
 | Storage | Local filesystem for images, SQLite for metadata |
+
+## Troubleshooting: Network / Install Issues
+
+### `pip install` times out
+
+Use a mirror:
+
+```bash
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### `npm install` hangs or fails
+
+**Node.js version must be >= 18.** Check with `node -v`.
+
+If the version is too old (e.g. v16), install Node 20 manually:
+
+```bash
+wget https://npmmirror.com/mirrors/node/v20.14.0/node-v20.14.0-linux-x64.tar.xz
+tar -xf node-v20.14.0-linux-x64.tar.xz
+export PATH=$PWD/node-v20.14.0-linux-x64/bin:$PATH
+```
+
+Then set the npm registry to a mirror before installing:
+
+```bash
+npm config set registry https://repo.huaweicloud.com/repository/npm/
+# or
+npm config set registry https://registry.npmmirror.com
+```
+
+If a previous `npm install` was interrupted, clean up first:
+
+```bash
+rm -rf node_modules package-lock.json
+npm install
+```
 
 ## Development
 
