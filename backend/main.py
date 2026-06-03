@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -14,9 +14,31 @@ import json
 import zipfile
 import shutil
 import tempfile
+import os
 from datetime import datetime
 
 BASE_DIR = Path(__file__).parent
+
+
+def _load_dotenv():
+    """Minimal .env loader so LLM_* settings are picked up without extra deps."""
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
+import llm
 DATA_DIR = BASE_DIR / "data"
 IMAGE_DIR = DATA_DIR / "images"
 DB_PATH = DATA_DIR / "annotation.db"
@@ -34,12 +56,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/images", StaticFiles(directory=str(IMAGE_DIR)), name="images")
+# follow_symlink=True so server-side bulk imports can symlink large image sets
+# into data/images/ instead of duplicating them (see setup_server_data.py --symlink).
+app.mount("/images", StaticFiles(directory=str(IMAGE_DIR), follow_symlink=True), name="images")
+
+
+# Annotation labels for visual facts (design doc section 4).
+FACT_LABELS = [
+    "correct",
+    "partially_correct",
+    "unsupported",
+    "hallucinated_object",
+    "wrong_attribute",
+    "wrong_action",
+    "wrong_spatial_relation",
+    "ocr_uncertain",
+    "subjective_inference",
+    "redundant",
+    "unsure",
+]
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -96,6 +138,46 @@ def init_db():
         timestamp INTEGER
     )
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS visual_facts (
+        id TEXT PRIMARY KEY,
+        image_id TEXT NOT NULL,
+        fact_id TEXT NOT NULL,
+        order_index INTEGER NOT NULL DEFAULT 0,
+        source_span TEXT,
+        source_start INTEGER,
+        source_end INTEGER,
+        visual_fact TEXT NOT NULL,
+        fact_type TEXT,
+        origin TEXT DEFAULT 'parsed',
+        created_at TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS fact_annotations (
+        id TEXT PRIMARY KEY,
+        fact_row_id TEXT NOT NULL,
+        image_id TEXT,
+        fact_id TEXT,
+        user TEXT NOT NULL,
+        annotator_label TEXT,
+        annotator_note TEXT,
+        created_at TEXT,
+        timestamp INTEGER,
+        UNIQUE(fact_row_id, user)
+    )
+    """)
+
+    # Parsing status columns on items (async fact parsing).
+    item_columns = [row[1] for row in cur.execute("PRAGMA table_info(items)").fetchall()]
+    if "parse_status" not in item_columns:
+        cur.execute("ALTER TABLE items ADD COLUMN parse_status TEXT DEFAULT 'none'")
+    if "parse_error" not in item_columns:
+        cur.execute("ALTER TABLE items ADD COLUMN parse_error TEXT DEFAULT ''")
+    if "fact_count" not in item_columns:
+        cur.execute("ALTER TABLE items ADD COLUMN fact_count INTEGER DEFAULT 0")
 
     attr_columns = [row[1] for row in cur.execute("PRAGMA table_info(attributes)").fetchall()]
     if "color" not in attr_columns:
@@ -221,10 +303,19 @@ def sanitize_color(color: Optional[str], fallback: str = "#DBEAFE") -> str:
 
 
 def item_out(row):
+    def col(name, default=None):
+        try:
+            return row[name]
+        except (IndexError, KeyError):
+            return default
+
     return {
         "id": row["id"],
         "imageUrl": row["image_url"],
         "caption": row["caption"],
+        "parseStatus": col("parse_status", "none") or "none",
+        "parseError": col("parse_error", "") or "",
+        "factCount": col("fact_count", 0) or 0,
     }
 
 
@@ -266,6 +357,122 @@ def record_out(row):
         "createdAt": row["created_at"],
         "timestamp": row["timestamp"],
     }
+
+
+def fact_out(row, annotation=None):
+    return {
+        "rowId": row["id"],
+        "imageId": row["image_id"],
+        "factId": row["fact_id"],
+        "orderIndex": row["order_index"],
+        "sourceSpan": row["source_span"],
+        "sourceStart": row["source_start"],
+        "sourceEnd": row["source_end"],
+        "visualFact": row["visual_fact"],
+        "factType": row["fact_type"],
+        "origin": row["origin"],
+        "annotatorLabel": annotation["annotator_label"] if annotation else None,
+        "annotatorNote": annotation["annotator_note"] if annotation else "",
+    }
+
+
+def replace_facts_for_item(conn, image_id: str, parsed: dict):
+    """Replace stored visual facts for an image with a freshly parsed set."""
+    facts = parsed.get("visual_facts") or []
+    conn.execute("DELETE FROM visual_facts WHERE image_id = ?", (image_id,))
+    # Drop annotations whose fact rows no longer exist.
+    conn.execute(
+        "DELETE FROM fact_annotations WHERE image_id = ? AND fact_row_id NOT IN "
+        "(SELECT id FROM visual_facts WHERE image_id = ?)",
+        (image_id, image_id),
+    )
+
+    created_at = now_text()
+    for order_index, fact in enumerate(facts):
+        row_id = new_id("fact")
+        conn.execute(
+            """
+            INSERT INTO visual_facts (
+                id, image_id, fact_id, order_index, source_span,
+                source_start, source_end, visual_fact, fact_type, origin, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row_id,
+                image_id,
+                str(fact.get("fact_id") or f"f{order_index + 1:03d}"),
+                order_index,
+                fact.get("source_span") or "",
+                fact.get("source_start"),
+                fact.get("source_end"),
+                fact.get("visual_fact") or "",
+                fact.get("fact_type") or "object",
+                "parsed",
+                created_at,
+            ),
+        )
+    return len(facts)
+
+
+def parse_and_store_facts(conn, image_id: str, caption: str) -> dict:
+    """Parse caption into facts and persist them. Never raises; reports status."""
+    try:
+        parsed = llm.parse_caption_to_facts(caption)
+    except llm.LLMNotConfigured as e:
+        return {"parsed": False, "factCount": 0, "error": str(e), "configured": False}
+    except llm.LLMError as e:
+        return {"parsed": False, "factCount": 0, "error": str(e), "configured": True}
+    except Exception as e:  # network/timeout/etc.
+        return {"parsed": False, "factCount": 0, "error": str(e), "configured": True}
+
+    count = replace_facts_for_item(conn, image_id, parsed)
+    return {"parsed": True, "factCount": count, "error": "", "configured": True}
+
+
+def set_parse_status(conn, image_id: str, status: str, error: str = "", fact_count: Optional[int] = None):
+    if fact_count is None:
+        conn.execute(
+            "UPDATE items SET parse_status = ?, parse_error = ? WHERE id = ?",
+            (status, error, image_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE items SET parse_status = ?, parse_error = ?, fact_count = ? WHERE id = ?",
+            (status, error, fact_count, image_id),
+        )
+
+
+def background_parse_items(image_ids: List[str]):
+    """Run in a FastAPI BackgroundTask (own DB connection, own thread).
+
+    Parses each image's caption into facts serially and records status so the
+    frontend can poll instead of blocking the upload request.
+    """
+    for image_id in image_ids:
+        conn = get_conn()
+        try:
+            item = conn.execute("SELECT * FROM items WHERE id = ?", (image_id,)).fetchone()
+            if not item:
+                conn.close()
+                continue
+            set_parse_status(conn, image_id, "parsing")
+            conn.commit()
+
+            status = parse_and_store_facts(conn, image_id, item["caption"])
+            if status["parsed"]:
+                set_parse_status(conn, image_id, "done", "", status["factCount"])
+            else:
+                set_parse_status(conn, image_id, "error", status["error"], 0)
+            conn.commit()
+        except Exception as e:  # never let a background task crash silently
+            try:
+                set_parse_status(conn, image_id, "error", str(e), 0)
+                conn.commit()
+            except Exception:
+                pass
+        finally:
+            conn.close()
 
 
 def get_item(conn, image_id: Optional[str]):
@@ -369,6 +576,16 @@ class ItemCaptionPatchIn(BaseModel):
     user: str
 
 
+class FactAnnotateIn(BaseModel):
+    user: str
+    annotator_label: str
+    annotator_note: str = ""
+
+
+class ParseFactsIn(BaseModel):
+    user: Optional[str] = None
+
+
 @app.post("/api/login")
 def login(payload: LoginIn):
     username = payload.username.strip()
@@ -410,7 +627,7 @@ def list_items(query: str = ""):
 
 
 @app.patch("/api/items/{image_id}/caption")
-def update_item_caption(image_id: str, payload: ItemCaptionPatchIn):
+def update_item_caption(image_id: str, payload: ItemCaptionPatchIn, background_tasks: BackgroundTasks):
     caption = normalize_caption_text(payload.caption)
     user = payload.user.strip()
 
@@ -426,7 +643,7 @@ def update_item_caption(image_id: str, payload: ItemCaptionPatchIn):
         raise HTTPException(status_code=404, detail="image item not found")
 
     conn.execute(
-        "UPDATE items SET caption = ? WHERE id = ?",
+        "UPDATE items SET caption = ?, parse_status = 'pending', parse_error = '', fact_count = 0 WHERE id = ?",
         (caption, image_id),
     )
 
@@ -442,19 +659,24 @@ def update_item_caption(image_id: str, payload: ItemCaptionPatchIn):
     row = conn.execute("SELECT * FROM items WHERE id = ?", (image_id,)).fetchone()
     conn.close()
 
+    background_tasks.add_task(background_parse_items, [image_id])
+
     return item_out(row)
 
 
 @app.post("/api/items/import")
-def import_items(payload: ImportItemsIn):
+def import_items(payload: ImportItemsIn, background_tasks: BackgroundTasks):
     conn = get_conn()
     cur = conn.cursor()
 
     if payload.replace:
         cur.execute("DELETE FROM items")
         cur.execute("DELETE FROM records")
+        cur.execute("DELETE FROM visual_facts")
+        cur.execute("DELETE FROM fact_annotations")
 
     count = 0
+    new_ids = []
 
     for i, item in enumerate(payload.items):
         image_id = str(item.get("id") or f"img_{i + 1:06d}")
@@ -472,12 +694,13 @@ def import_items(payload: ImportItemsIn):
 
         cur.execute(
             """
-            INSERT OR REPLACE INTO items (id, image_url, caption)
-            VALUES (?, ?, ?)
+            INSERT OR REPLACE INTO items (id, image_url, caption, parse_status, parse_error, fact_count)
+            VALUES (?, ?, ?, 'pending', '', 0)
             """,
             (image_id, image_url, caption),
         )
         count += 1
+        new_ids.append(image_id)
 
     if payload.user:
         insert_record(
@@ -491,11 +714,15 @@ def import_items(payload: ImportItemsIn):
     conn.commit()
     conn.close()
 
-    return {"imported": count}
+    if new_ids:
+        background_tasks.add_task(background_parse_items, new_ids)
+
+    return {"imported": count, "queuedForParsing": len(new_ids)}
 
 
 @app.post("/api/items/upload")
 async def upload_image_with_caption(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     caption: str = Form(...),
     user: str = Form(...),
@@ -532,8 +759,8 @@ async def upload_image_with_caption(
 
     conn.execute(
         """
-        INSERT OR REPLACE INTO items (id, image_url, caption)
-        VALUES (?, ?, ?)
+        INSERT OR REPLACE INTO items (id, image_url, caption, parse_status, parse_error, fact_count)
+        VALUES (?, ?, ?, 'pending', '', 0)
         """,
         (item_id, image_url, caption),
     )
@@ -555,11 +782,14 @@ async def upload_image_with_caption(
 
     conn.close()
 
+    background_tasks.add_task(background_parse_items, [item_id])
+
     return item_out(row)
 
 
 @app.post("/api/items/upload-paired-files")
 async def upload_paired_files(
+    background_tasks: BackgroundTasks,
     images_zip: UploadFile = File(...),
     captions_file: UploadFile = File(...),
     user: str = Form(...),
@@ -612,6 +842,7 @@ async def upload_paired_files(
 
         conn = get_conn()
         imported = 0
+        new_ids = []
         missing_images = []
         matched_names = set()
 
@@ -638,12 +869,13 @@ async def upload_paired_files(
 
             conn.execute(
                 """
-                INSERT OR REPLACE INTO items (id, image_url, caption)
-                VALUES (?, ?, ?)
+                INSERT OR REPLACE INTO items (id, image_url, caption, parse_status, parse_error, fact_count)
+                VALUES (?, ?, ?, 'pending', '', 0)
                 """,
                 (item_id, image_url, caption),
             )
             imported += 1
+            new_ids.append(item_id)
 
         unused_images = sorted(set(image_map.keys()) - matched_names)
 
@@ -658,8 +890,12 @@ async def upload_paired_files(
         conn.commit()
         conn.close()
 
+    if new_ids:
+        background_tasks.add_task(background_parse_items, new_ids)
+
     return {
         "imported": imported,
+        "queuedForParsing": len(new_ids),
         "missingImages": missing_images,
         "unusedImages": unused_images,
     }
@@ -838,76 +1074,245 @@ def delete_record(record_id: str, payload: DeleteIn):
     return {"ok": True}
 
 
-@app.get("/api/export/json")
-def export_json():
+@app.get("/api/llm/status")
+def llm_status():
+    return {"configured": llm.is_configured()}
+
+
+@app.get("/api/items/{image_id}/facts")
+def list_facts(image_id: str, user: Optional[str] = None):
     conn = get_conn()
-    attrs = [attr_out(row) for row in conn.execute("SELECT * FROM attributes").fetchall()]
-    items = [item_out(row) for row in conn.execute("SELECT * FROM items").fetchall()]
-    records = [record_out(row) for row in conn.execute("SELECT * FROM records ORDER BY timestamp").fetchall()]
+    fact_rows = conn.execute(
+        "SELECT * FROM visual_facts WHERE image_id = ? ORDER BY order_index",
+        (image_id,),
+    ).fetchall()
+
+    annotations = {}
+    if user:
+        ann_rows = conn.execute(
+            "SELECT * FROM fact_annotations WHERE image_id = ? AND user = ?",
+            (image_id, user),
+        ).fetchall()
+        annotations = {row["fact_row_id"]: row for row in ann_rows}
+
+    conn.close()
+    return [fact_out(row, annotations.get(row["id"])) for row in fact_rows]
+
+
+@app.get("/api/items/{image_id}/parse-status")
+def parse_status(image_id: str):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT parse_status, parse_error, fact_count FROM items WHERE id = ?",
+        (image_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="image item not found")
+    return {
+        "status": row["parse_status"] or "none",
+        "error": row["parse_error"] or "",
+        "factCount": row["fact_count"] or 0,
+    }
+
+
+@app.post("/api/items/{image_id}/parse-facts")
+def parse_facts(image_id: str, payload: ParseFactsIn):
+    conn = get_conn()
+    item = get_item(conn, image_id)
+    if not item:
+        conn.close()
+        raise HTTPException(status_code=404, detail="image item not found")
+
+    set_parse_status(conn, image_id, "parsing")
+    conn.commit()
+
+    status = parse_and_store_facts(conn, image_id, item["caption"])
+    if not status["parsed"]:
+        set_parse_status(conn, image_id, "error", status["error"], 0)
+        conn.commit()
+        conn.close()
+        code = 400 if status.get("configured") else 503
+        raise HTTPException(status_code=code, detail=status["error"] or "parse failed")
+
+    set_parse_status(conn, image_id, "done", "", status["factCount"])
+    conn.commit()
+    rows = conn.execute(
+        "SELECT * FROM visual_facts WHERE image_id = ? ORDER BY order_index",
+        (image_id,),
+    ).fetchall()
+    conn.close()
+    return {"factCount": status["factCount"], "facts": [fact_out(row) for row in rows]}
+
+
+@app.post("/api/facts/{fact_row_id}/annotate")
+def annotate_fact(fact_row_id: str, payload: FactAnnotateIn):
+    user = payload.user.strip()
+    label = payload.annotator_label.strip()
+
+    if not user:
+        raise HTTPException(status_code=400, detail="user is required")
+    if label not in FACT_LABELS:
+        raise HTTPException(status_code=400, detail=f"invalid label: {label}")
+
+    conn = get_conn()
+    fact = conn.execute(
+        "SELECT * FROM visual_facts WHERE id = ?", (fact_row_id,)
+    ).fetchone()
+    if not fact:
+        conn.close()
+        raise HTTPException(status_code=404, detail="visual fact not found")
+
+    existing = conn.execute(
+        "SELECT * FROM fact_annotations WHERE fact_row_id = ? AND user = ?",
+        (fact_row_id, user),
+    ).fetchone()
+
+    created_at = now_text()
+    timestamp = int(time.time() * 1000)
+
+    if existing:
+        conn.execute(
+            """
+            UPDATE fact_annotations
+            SET annotator_label = ?, annotator_note = ?, created_at = ?, timestamp = ?
+            WHERE id = ?
+            """,
+            (label, payload.annotator_note, created_at, timestamp, existing["id"]),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO fact_annotations (
+                id, fact_row_id, image_id, fact_id, user,
+                annotator_label, annotator_note, created_at, timestamp
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("fann"),
+                fact_row_id,
+                fact["image_id"],
+                fact["fact_id"],
+                user,
+                label,
+                payload.annotator_note,
+                created_at,
+                timestamp,
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+    return {"ok": True, "annotatorLabel": label, "annotatorNote": payload.annotator_note}
+
+
+def collect_export_items():
+    """Build the fact-centric export structure (design doc section 9)."""
+    conn = get_conn()
+    item_rows = conn.execute("SELECT * FROM items ORDER BY id").fetchall()
+    fact_rows = conn.execute("SELECT * FROM visual_facts ORDER BY image_id, order_index").fetchall()
+    ann_rows = conn.execute("SELECT * FROM fact_annotations").fetchall()
     conn.close()
 
+    # Map fact_row_id -> list of annotations (one per user).
+    ann_by_fact: Dict[str, List[dict]] = {}
+    for row in ann_rows:
+        ann_by_fact.setdefault(row["fact_row_id"], []).append(
+            {
+                "user": row["user"],
+                "annotator_label": row["annotator_label"],
+                "annotator_note": row["annotator_note"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    facts_by_image: Dict[str, List[dict]] = {}
+    for row in fact_rows:
+        facts_by_image.setdefault(row["image_id"], []).append(
+            {
+                "fact_id": row["fact_id"],
+                "source_span": row["source_span"],
+                "source_start": row["source_start"],
+                "source_end": row["source_end"],
+                "visual_fact": row["visual_fact"],
+                "fact_type": row["fact_type"],
+                "annotations": ann_by_fact.get(row["id"], []),
+            }
+        )
+
+    items = []
+    for row in item_rows:
+        items.append(
+            {
+                "image_id": row["id"],
+                "image_url": row["image_url"],
+                "caption": row["caption"],
+                "visual_facts": facts_by_image.get(row["id"], []),
+            }
+        )
+    return items
+
+
+@app.get("/api/export/json")
+def export_json():
+    items = collect_export_items()
     payload = {
         "exportedAt": datetime.now().isoformat(),
         "totalImages": len(items),
         "items": items,
-        "attributes": attrs,
-        "records": records,
     }
-
     return JSONResponse(
         payload,
         headers={
-            "Content-Disposition": "attachment; filename=caption_annotation_records.json"
+            "Content-Disposition": "attachment; filename=visual_fact_annotations.json"
         },
     )
 
 
 @app.get("/api/export/csv")
 def export_csv():
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM records ORDER BY timestamp").fetchall()
-    conn.close()
+    items = collect_export_items()
 
     output = io.StringIO()
     writer = csv.writer(output)
-
     writer.writerow([
-        "record_id",
         "image_id",
-        "user",
-        "action",
-        "attribute",
-        "selected_text",
-        "range_start",
-        "range_end",
-        "note",
-        "created_at",
         "caption",
-        "image_url",
+        "fact_id",
+        "fact_type",
+        "source_span",
+        "source_start",
+        "source_end",
+        "visual_fact",
+        "user",
+        "annotator_label",
+        "annotator_note",
     ])
 
-    for row in rows:
-        writer.writerow([
-            row["id"],
-            row["image_id"],
-            row["user"],
-            row["action"],
-            row["attribute_name"],
-            row["selected_text"],
-            row["range_start"],
-            row["range_end"],
-            row["note"],
-            row["created_at"],
-            row["image_caption"],
-            row["image_url"],
-        ])
+    for item in items:
+        for fact in item["visual_facts"]:
+            annotations = fact["annotations"] or [{}]
+            for ann in annotations:
+                writer.writerow([
+                    item["image_id"],
+                    item["caption"],
+                    fact["fact_id"],
+                    fact["fact_type"],
+                    fact["source_span"],
+                    fact["source_start"],
+                    fact["source_end"],
+                    fact["visual_fact"],
+                    ann.get("user", ""),
+                    ann.get("annotator_label", ""),
+                    ann.get("annotator_note", ""),
+                ])
 
     output.seek(0)
-
     return StreamingResponse(
         output,
         media_type="text/csv",
         headers={
-            "Content-Disposition": "attachment; filename=caption_annotation_records.csv"
+            "Content-Disposition": "attachment; filename=visual_fact_annotations.csv"
         },
     )

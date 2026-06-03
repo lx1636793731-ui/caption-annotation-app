@@ -5,4 +5,15 @@ __pycache__/
 backend/data/annotation.db
 .DS_Store
 
-backend/data/  
+backend/data/
+
+# Secrets / local config (never commit API keys)
+.env
+backend/.env
+*.local.env
+
+# Frontend build output
+frontend/dist/
+
+# Internal design docs (kept local, not published)
+Caption结构化拆分.md
