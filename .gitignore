@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 backend/data/annotation.db
 .DS_Store
+
+backend/data/  
